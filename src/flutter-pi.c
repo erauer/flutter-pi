@@ -55,6 +55,7 @@
 #include <texture_registry.h>
 #include <plugins/text_input.h>
 #include <plugins/raw_keyboard.h>
+#include <filesystem_layout.h>
 
 #ifdef ENABLE_MTRACE
 #   include <mcheck.h>
@@ -66,15 +67,19 @@ const char *const usage ="\
 flutter-pi - run flutter apps on your Raspberry Pi.\n\
 \n\
 USAGE:\n\
-  flutter-pi [options] <asset bundle path> [flutter engine options]\n\
+  flutter-pi [options] <bundle path> [flutter engine options]\n\
 \n\
 OPTIONS:\n\
   --release                  Run the app in release mode. The AOT snapshot\n\
-                             of the app (\"app.so\") must be located inside the\n\
-                             asset bundle directory.\n\
+                             of the app must be located inside the bundle directory.\n\
                              This also requires a libflutter_engine.so that was\n\
                              built with --runtime-mode=release.\n\
-\n\
+                             \n\
+  --profile                  Run the app in profile mode. The AOT snapshot\n\
+                             of the app must be located inside the bundle directory.\n\
+                             This also requires a libflutter_engine.so that was\n\
+                             built with --runtime-mode=profile.\n\
+                             \n\
   -o, --orientation <orientation>  Start the app in this orientation. Valid\n\
                              for <orientation> are: portrait_up, landscape_left,\n\
                              portrait_down, landscape_right.\n\
@@ -867,7 +872,7 @@ struct texture *flutterpi_create_texture(struct flutterpi *flutterpi) {
 const char *flutterpi_get_asset_bundle_path(
     struct flutterpi *flutterpi
 ) {
-    return flutterpi->flutter.asset_bundle_path;
+    return flutterpi->flutter.paths->asset_bundle_path;
 }
 
 /// TODO: Make this refcounted if we're gonna use it from multiple threads.
@@ -1243,6 +1248,16 @@ static int init_display(void) {
             continue;
         }
 
+        for_each_connector_in_drmdev(flutterpi.drm.drmdev, connector) {
+            if (connector->connector->connection == DRM_MODE_CONNECTED) {
+                goto found_connected_connector;
+            }
+        }
+        LOG_ERROR("Device \"%s\" doesn't have a display connected. Skipping.\n", device->nodes[DRM_NODE_PRIMARY]);
+        continue;
+
+
+        found_connected_connector:
         break;
     }
 
@@ -1420,6 +1435,7 @@ static int init_display(void) {
         return -ok;
     }
 
+    locales_print(flutterpi.locales);
     printf(
         "===================================\n"
         "display mode:\n"
@@ -1444,8 +1460,14 @@ static int init_display(void) {
 
     flutterpi.gbm.surface = gbm_surface_create_with_modifiers(flutterpi.gbm.device, flutterpi.display.width, flutterpi.display.height, flutterpi.gbm.format, &flutterpi.gbm.modifier, 1);
     if (flutterpi.gbm.surface == NULL) {
-        perror("[flutter-pi] Could not create GBM Surface. gbm_surface_create_with_modifiers");
-        return errno;
+        perror("[flutter-pi] Could not create GBM Surface. gbm_surface_create_with_modifiers. Will attempt with gbm_surface_create");
+
+		flutterpi.gbm.surface = gbm_surface_create(flutterpi.gbm.device, flutterpi.display.width, flutterpi.display.height, flutterpi.gbm.format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+
+		if (flutterpi.gbm.surface == NULL) {
+			perror("[flutter-pi] Could not create GBM Surface even with gbm_surface_create");
+			return errno;
+		}
     }
 
     /**********************
@@ -1658,6 +1680,7 @@ static int init_display(void) {
  **************************/
 static int init_application(void) {
     FlutterEngineAOTDataSource aot_source;
+    enum flutter_runtime_mode runtime_mode;
     struct libflutter_engine *libflutter_engine;
     struct texture_registry *texture_registry;
     struct plugin_registry *plugin_registry;
@@ -1665,36 +1688,55 @@ static int init_application(void) {
     FlutterEngineAOTData aot_data;
     FlutterEngineResult engine_result;
     FlutterProjectArgs project_args = {0};
-    void *libflutter_engine_handle;
+    void *engine_handle;
     int ok;
 
-    libflutter_engine_handle = NULL;
-    if (flutterpi.flutter.runtime_mode == kRelease) {
-        libflutter_engine_handle = dlopen("libflutter_engine.so.release", RTLD_LOCAL | RTLD_NOW);
-        if (libflutter_engine_handle == NULL) {
-            LOG_ERROR("[flutter-pi] Warning: Could not load libflutter_engine.so.release: %s. Trying to open libflutter_engine.so...\n", dlerror());
-        }
-    } else if (flutterpi.flutter.runtime_mode == kDebug) {
-        libflutter_engine_handle = dlopen("libflutter_engine.so.debug", RTLD_LOCAL | RTLD_NOW);
-        if (libflutter_engine_handle == NULL) {
-            LOG_ERROR("[flutter-pi] Warning: Could not load libflutter_engine.so.debug: %s. Trying to open libflutter_engine.so...\n", dlerror());
+    runtime_mode = flutterpi.flutter.runtime_mode;
+
+    engine_handle = NULL;
+    if (flutterpi.flutter.paths->flutter_engine_path != NULL) {
+        engine_handle = dlopen(flutterpi.flutter.paths->flutter_engine_path, RTLD_LOCAL | RTLD_NOW);
+        if (engine_handle == NULL) {
+            LOG_DEBUG(
+                "Info: Could not load flutter engine from app bundle. dlopen(\"%s\"): %s.\n",
+                flutterpi.flutter.paths->flutter_engine_path,
+                dlerror()
+            );
         }
     }
 
-    if (libflutter_engine_handle == NULL) {
-        libflutter_engine_handle = dlopen("libflutter_engine.so", RTLD_LOCAL | RTLD_NOW);
-        if (libflutter_engine_handle == NULL) {
-            LOG_ERROR("Could not load libflutter_engine.so. dlopen: %s", dlerror());
-            LOG_ERROR("Could not find a fitting libflutter_engine.\n");
-            return EINVAL;
+    if (engine_handle == NULL && flutterpi.flutter.paths->flutter_engine_dlopen_name != NULL) {
+        engine_handle = dlopen(flutterpi.flutter.paths->flutter_engine_dlopen_name, RTLD_LOCAL | RTLD_NOW);
+        if (engine_handle == NULL) {
+            LOG_DEBUG(
+                "Info: Could not load flutter engine. dlopen(\"%s\"): %s.\n",
+                flutterpi.flutter.paths->flutter_engine_dlopen_name,
+                dlerror()
+            );
         }
+    }
+
+    if (engine_handle == NULL && flutterpi.flutter.paths->flutter_engine_dlopen_name_fallback != NULL) {
+        engine_handle = dlopen(flutterpi.flutter.paths->flutter_engine_dlopen_name_fallback, RTLD_LOCAL | RTLD_NOW);
+        if (engine_handle == NULL) {
+            LOG_DEBUG(
+                "Info: Could not load flutter engine. dlopen(\"%s\"): %s.\n",
+                flutterpi.flutter.paths->flutter_engine_dlopen_name_fallback,
+                dlerror()
+            );
+        }
+    }
+
+    if (engine_handle == NULL) {
+        LOG_ERROR("Error: Could not load flutter engine from any location. Make sure you have installed the engine binaries.\n");
+        return EINVAL;
     }
 
     libflutter_engine = &flutterpi.flutter.libflutter_engine;
 
 #	define LOAD_LIBFLUTTER_ENGINE_PROC(name) \
         do { \
-            libflutter_engine->name = dlsym(libflutter_engine_handle, #name); \
+            libflutter_engine->name = dlsym(engine_handle, #name); \
             if (!libflutter_engine->name) {\
                 perror("[flutter-pi] Could not resolve libflutter_engine procedure " #name ". dlsym"); \
                 return EINVAL; \
@@ -1777,8 +1819,8 @@ static int init_application(void) {
     // configure the project
     project_args = (FlutterProjectArgs) {
         .struct_size = sizeof(FlutterProjectArgs),
-        .assets_path = flutterpi.flutter.asset_bundle_path,
-        .icu_data_path = flutterpi.flutter.icu_data_path,
+        .assets_path = flutterpi.flutter.paths->asset_bundle_path,
+        .icu_data_path = flutterpi.flutter.paths->icudtl_path,
         .command_line_argc = flutterpi.flutter.engine_argc,
         .command_line_argv = (const char * const*) flutterpi.flutter.engine_argv,
         .platform_message_callback = on_platform_message,
@@ -1805,7 +1847,8 @@ static int init_application(void) {
                 .runs_task_on_current_thread_callback = runs_platform_tasks_on_current_thread,
                 .post_task_callback = on_post_flutter_task
             },
-            .render_task_runner = NULL
+            .render_task_runner = NULL,
+            .thread_priority_setter = NULL
         },
         .shutdown_dart_vm_when_done = true,
         .compositor = &flutter_compositor,
@@ -1818,14 +1861,14 @@ static int init_application(void) {
     };
 
     bool engine_is_aot = libflutter_engine->FlutterEngineRunsAOTCompiledDartCode();
-    if ((engine_is_aot == true) && (flutterpi.flutter.runtime_mode != kRelease)) {
+    if (engine_is_aot == true && runtime_mode == kDebug) {
         LOG_ERROR(
-            "The flutter engine was built for release (AOT) mode, but flutter-pi was not started up in release mode.\n"
+            "The flutter engine was built for release or profile (AOT) mode, but flutter-pi was not started up in release or profile mode.\n"
             "Either you swap out the libflutter_engine.so with one that was built for debug mode, or you start"
-            "flutter-pi with the --release flag and make sure a valid \"app.so\" is located inside the asset bundle directory.\n"
+            "flutter-pi with the --release or --profile flag and make sure a valid \"app.so\" is located inside the asset bundle directory.\n"
         );
         return EINVAL;
-    } else if ((engine_is_aot == false) && (flutterpi.flutter.runtime_mode != kDebug)) {
+    } else if (engine_is_aot == false && runtime_mode != kDebug) {
         LOG_ERROR(
             "The flutter engine was built for debug mode, but flutter-pi was started up in release mode.\n"
             "Either you swap out the libflutter_engine.so with one that was built for release mode,"
@@ -1834,9 +1877,9 @@ static int init_application(void) {
         return EINVAL;
     }
 
-    if (flutterpi.flutter.runtime_mode == kRelease) {
+    if (flutterpi.flutter.runtime_mode != kDebug) {
         aot_source = (FlutterEngineAOTDataSource) {
-            .elf_path = flutterpi.flutter.app_elf_path,
+            .elf_path = flutterpi.flutter.paths->app_elf_path,
             .type = kFlutterEngineAOTDataSourceTypeElfPath
         };
 
@@ -1900,7 +1943,13 @@ static int init_application(void) {
             .struct_size = sizeof(FlutterWindowMetricsEvent),
             .width = flutterpi.view.width,
             .height = flutterpi.view.height,
-            .pixel_ratio = flutterpi.display.pixel_ratio
+            .pixel_ratio = flutterpi.display.pixel_ratio,
+            .left = 0,
+            .top = 0,
+            .physical_view_inset_top = 0,
+            .physical_view_inset_right = 0,
+            .physical_view_inset_bottom = 0,
+            .physical_view_inset_left = 0
         }
     );
     if (engine_result != kSuccess) {
@@ -2105,44 +2154,19 @@ static int init_user_input(void) {
     return 0;
 }
 
+static bool path_exists(const char *path) {
+    return access(path, R_OK) == 0;
+}
 
-static bool setup_paths(void) {
-    char *kernel_blob_path, *icu_data_path, *app_elf_path;
-    #define PATH_EXISTS(path) (access((path),R_OK)==0)
-
-    if (!PATH_EXISTS(flutterpi.flutter.asset_bundle_path)) {
-        LOG_ERROR("Asset Bundle Directory \"%s\" does not exist\n", flutterpi.flutter.asset_bundle_path);
-        return false;
-    }
-    
-    asprintf(&kernel_blob_path, "%s/kernel_blob.bin", flutterpi.flutter.asset_bundle_path);
-    asprintf(&app_elf_path, "%s/app.so", flutterpi.flutter.asset_bundle_path);
-
-    if (flutterpi.flutter.runtime_mode == kDebug) {
-        if (!PATH_EXISTS(kernel_blob_path)) {
-            LOG_ERROR("Could not find \"kernel.blob\" file inside \"%s\", which is required for debug mode.\n", flutterpi.flutter.asset_bundle_path);
-            return false;
-        }
-    } else if (flutterpi.flutter.runtime_mode == kRelease) {
-        if (!PATH_EXISTS(app_elf_path)) {
-            LOG_ERROR("Could not find \"app.so\" file inside \"%s\", which is required for release and profile mode.\n", flutterpi.flutter.asset_bundle_path);
-            return false;
-        }
-    }
-
-    asprintf(&icu_data_path, "/usr/lib/icudtl.dat");
-    if (!PATH_EXISTS(icu_data_path)) {
-        LOG_ERROR("Could not find \"icudtl.dat\" file inside \"/usr/lib/\".\n");
-        return false;
-    }
-
-    flutterpi.flutter.kernel_blob_path = kernel_blob_path;
-    flutterpi.flutter.icu_data_path = icu_data_path;
-    flutterpi.flutter.app_elf_path = app_elf_path;
-
-    return true;
-
-    #undef PATH_EXISTS
+static struct flutter_paths *setup_paths(enum flutter_runtime_mode runtime_mode, const char *app_bundle_path) {
+#if defined(FILESYSTEM_LAYOUT_DEFAULT)
+    return fs_layout_flutterpi_resolve(app_bundle_path, runtime_mode);
+#elif defined(FILESYSTEM_LAYOUT_METAFLUTTER)
+    return fs_layout_metaflutter_resolve(app_bundle_path, runtime_mode);
+#else
+    #error "Exactly one of FILESYSTEM_LAYOUT_DEFAULT or FILESYSTEM_LAYOUT_METAFLUTTER must be defined."
+    return NULL;
+#endif
 }
 
 static bool parse_cmd_args(int argc, char **argv) {
@@ -2153,6 +2177,7 @@ static bool parse_cmd_args(int argc, char **argv) {
 
     struct option long_options[] = {
         {"release", no_argument, &runtime_mode_int, kRelease},
+        {"profile", no_argument, &runtime_mode_int, kProfile},
         {"input", required_argument, NULL, 'i'},
         {"orientation", required_argument, NULL, 'o'},
         {"rotation", required_argument, NULL, 'r'},
@@ -2274,7 +2299,7 @@ static bool parse_cmd_args(int argc, char **argv) {
         return false;
     }
 
-    flutterpi.flutter.asset_bundle_path = strdup(argv[optind]);
+    flutterpi.flutter.bundle_path = realpath(argv[optind], NULL);
     flutterpi.flutter.runtime_mode = runtime_mode_int;
 
     argv[optind] = argv[0];
@@ -2285,6 +2310,7 @@ static bool parse_cmd_args(int argc, char **argv) {
 }
 
 int init(int argc, char **argv) {
+    struct flutter_paths *paths;
     int ok;
 
 #ifdef ENABLE_MTRACE
@@ -2296,10 +2322,12 @@ int init(int argc, char **argv) {
         return EINVAL;
     }
 
-    ok = setup_paths();
-    if (ok == false) {
+    paths = setup_paths(flutterpi.flutter.runtime_mode, flutterpi.flutter.bundle_path);
+    if (paths == NULL) {
         return EINVAL;
     }
+
+    flutterpi.flutter.paths = paths;
 
     ok = init_main_loop();
     if (ok != 0) {
