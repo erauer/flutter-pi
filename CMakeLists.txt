@@ -30,7 +30,7 @@ if(NOT CMAKE_BUILD_TYPE)
     message(STATUS "CMAKE_BUILD_TYPE not set, defaulting to Release.")
 endif()
 
-project(flutter-pi LANGUAGES C CXX VERSION "1.0.0")
+project(flutter-pi LANGUAGES C VERSION "1.0.0")
 
 message(STATUS "Generator .............. ${CMAKE_GENERATOR}")
 message(STATUS "Build Type ............. ${CMAKE_BUILD_TYPE}")
@@ -40,13 +40,20 @@ option(BUILD_TEXT_INPUT_PLUGIN "Include the text input plugin in the finished bi
 option(BUILD_RAW_KEYBOARD_PLUGIN "Include the raw keyboard plugin in the finished binary. Enables raw keycode listening in flutter via the flutter RawKeyboard interface." ON)
 option(BUILD_TEST_PLUGIN "Include the test plugin in the finished binary. Allows testing platform channel communication." OFF)
 option(BUILD_OMXPLAYER_VIDEO_PLAYER_PLUGIN "Include the omxplayer_video_player plugin in the finished binary. Allows for hardware accelerated video playback in flutter using omxplayer." ON)
-option(BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN "Include the gstreamer_video_player plugin in the finished binary. Allows for more stable, hardware accelerated video playback in flutter using gstreamer." ON)
+option(BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN "Include the gstreamer based video plugins in the finished binary. Allows for more stable, hardware accelerated video playback in flutter using gstreamer." ON)
+option(BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Include the gstreamer based audio plugins in the finished binary." ON)
 option(TRY_BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN "Don't throw an error if the gstreamer libs aren't found, instead just don't build the gstreamer video player plugin in that case." ON)
+option(TRY_BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Don't throw an error if the gstreamer libs aren't found, instead just don't build gstreamer audio plugin." ON)
 option(DUMP_ENGINE_LAYERS "True if flutter-pi should dump the list of rendering layers that the flutter engine sends to flutter-pi on each draw." OFF)
 option(ENABLE_TSAN "True to build & link with -fsanitize=thread" OFF)
 option(ENABLE_ASAN "True to build & link with -fsanitize=address" OFF)
 option(ENABLE_UBSAN "True to build & link with -fsanitize=undefined" OFF)
 option(ENABLE_MTRACE "True if flutter-pi should call GNU mtrace() on startup." OFF)
+
+set(FILESYSTEM_LAYOUTS default meta-flutter)
+set(FILESYSTEM_LAYOUT "default" CACHE STRING "Where to look for the icudtl.dat, app.so/libapp.so, flutter asset bundle.")
+set_property(CACHE FILESYSTEM_LAYOUT PROPERTY STRINGS ${FILESYSTEM_LAYOUTS})
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT FLUTTER_EMBEDDER_HEADER)
@@ -98,9 +105,6 @@ endif()
 include(ExternalProject)
 include(CheckCCompilerFlag)
 
-set(ENV{PKG_CONFIG_PATH} ${PKG_CONFIG_PATH})
-message(STATUS "PKG_CONFIG_PATH ........ $ENV{PKG_CONFIG_PATH}")
-
 include(FindPkgConfig)
 pkg_check_modules(DRM REQUIRED libdrm)
 pkg_check_modules(GBM REQUIRED gbm)
@@ -125,6 +129,7 @@ add_executable(flutter-pi
   src/locales.c
   src/notifier_listener.c
   src/pixel_format.c
+  src/filesystem_layout.c
   src/plugins/services.c
 )
 
@@ -133,10 +138,11 @@ target_link_libraries(flutter-pi
   ${GBM_LDFLAGS}
   ${EGL_LDFLAGS}
   ${GLESV2_LDFLAGS}
-  ${LIBSYSTEMD_LDFLAGS}
-  ${LIBINPUT_LDFLAGS}
-  ${LIBUDEV_LDFLAGS}
-  ${LIBXKBCOMMON_LDFLAGS}
+  EGL
+  systemd #${LIBSYSTEMD_LDFLAGS}
+  input #${LIBINPUT_LDFLAGS}
+  xkbcommon #${LIBUDEV_LDFLAGS}
+  udev #${LIBXKBCOMMON_LDFLAGS}
   pthread dl rt m atomic
 )
 
@@ -155,7 +161,7 @@ target_include_directories(flutter-pi PRIVATE
 )
 
 target_compile_options(flutter-pi PRIVATE
-  ${DRM_CFLAGS}  
+  ${DRM_CFLAGS}
   ${GBM_CFLAGS}
   ${EGL_CFLAGS}
   ${GLESV2_CFLAGS}
@@ -163,13 +169,38 @@ target_compile_options(flutter-pi PRIVATE
   ${LIBINPUT_CFLAGS}
   ${LIBUDEV_CFLAGS}
   ${LIBXKBCOMMON_CFLAGS}
-  $<$<CONFIG:Debug>:-O0 -Wall -Wextra -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers -Werror -ggdb -DDEBUG>
+  $<$<CONFIG:Debug>:-O0 -Wall -Wextra -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers -Werror -ggdb -U_FORTIFY_SOURCE -DDEBUG>
   $<$<CONFIG:RelWithDebInfo>:-O2 -Wall -Wextra -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers -ggdb>
   $<$<CONFIG:Release>:-O2 -Wall -Wextra -Wno-unused-function -Wno-sign-compare -Wno-missing-field-initializers -ggdb>
 )
 
-# TODO: Just unconditionally define those, make them optional later 
+# There's no other way to query the libinput version (in code) somehow.
+# So we need to roll our own libinput version macro
+string(REPLACE "." ";" LIBINPUT_VERSION_AS_LIST ${LIBINPUT_VERSION})
+list(GET LIBINPUT_VERSION_AS_LIST 0 LIBINPUT_VERSION_MAJOR)
+list(GET LIBINPUT_VERSION_AS_LIST 1 LIBINPUT_VERSION_MINOR)
+list(GET LIBINPUT_VERSION_AS_LIST 2 LIBINPUT_VERSION_PATCH)
+
+target_compile_definitions(flutter-pi PRIVATE
+  LIBINPUT_VERSION_MAJOR=${LIBINPUT_VERSION_MAJOR}
+  LIBINPUT_VERSION_MINOR=${LIBINPUT_VERSION_MINOR}
+  LIBINPUT_VERSION_PATCH=${LIBINPUT_VERSION_PATCH}
+)
+
+# TODO: Just unconditionally define those, make them optional later
 target_compile_definitions(flutter-pi PRIVATE HAS_KMS HAS_EGL HAS_GBM HAS_FBDEV)
+
+if(NOT FILESYSTEM_LAYOUT IN_LIST FILESYSTEM_LAYOUTS)
+  message(FATAL_ERROR "FILESYSTEM_LAYOUT must be one of ${FILESYSTEM_LAYOUTS}")
+endif()
+
+message(STATUS "Filesystem Layout ...... ${FILESYSTEM_LAYOUT}")
+
+if(FILESYSTEM_LAYOUT STREQUAL default)
+  target_compile_definitions(flutter-pi PRIVATE "FILESYSTEM_LAYOUT_DEFAULT")
+elseif(FILESYSTEM_LAYOUT STREQUAL meta-flutter)
+  target_compile_definitions(flutter-pi PRIVATE "FILESYSTEM_LAYOUT_METAFLUTTER")
+endif()
 
 # TODO: We actually don't need the compile definitions anymore, except for
 # text input and raw keyboard plugin (because those have special treatment
@@ -221,6 +252,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       ${LIBGSTREAMER_APP_LDFLAGS}
       ${LIBGSTREAMER_ALLOCATORS_LDFLAGS}
       ${LIBGSTREAMER_VIDEO_LDFLAGS}
+      ${LIBGSTREAMER_AUDIO_LIBRARY_DIRS}
     )
     target_include_directories(flutter-pi PRIVATE
       ${LIBGSTREAMER_INCLUDE_DIRS}
@@ -228,6 +260,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       ${LIBGSTREAMER_APP_INCLUDE_DIRS}
       ${LIBGSTREAMER_ALLOCATORS_INCLUDE_DIRS}
       ${LIBGSTREAMER_VIDEO_INCLUDE_DIRS}
+      ${LIBGSTREAMER_AUDIO_INCLUDE_DIRS}
     )
     target_compile_options(flutter-pi PRIVATE
       ${LIBGSTREAMER_CFLAGS}
@@ -235,9 +268,47 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       ${LIBGSTREAMER_APP_CFLAGS}
       ${LIBGSTREAMER_ALLOCATORS_CFLAGS}
       ${LIBGSTREAMER_VIDEO_CFLAGS}
+      ${LIBGSTREAMER_AUDIO_CFLAGS}
     )
   else()
     message(NOTICE "Couldn't find gstreamer libraries. Gstreamer video player plugin won't be build.")
+  endif()
+endif()
+
+if (BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN)
+  if (TRY_BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN)
+    pkg_check_modules(LIBGSTREAMER gstreamer-1.0)
+    pkg_check_modules(LIBGSTREAMER_APP gstreamer-app-1.0)
+    pkg_check_modules(LIBGSTREAMER_AUDIO gstreamer-audio-1.0)
+  else()
+    pkg_check_modules(LIBGSTREAMER REQUIRED gstreamer-1.0)
+    pkg_check_modules(LIBGSTREAMER_APP REQUIRED gstreamer-app-1.0)
+    pkg_check_modules(LIBGSTREAMER_AUDIO REQUIRED gstreamer-audio-1.0)
+  endif()
+
+  if (LIBGSTREAMER_FOUND AND LIBGSTREAMER_APP_FOUND AND LIBGSTREAMER_AUDIO_FOUND)
+    target_sources(flutter-pi PRIVATE
+      src/plugins/audioplayers/plugin.c
+      src/plugins/audioplayers/player.c
+    )
+    target_compile_definitions(flutter-pi PRIVATE "BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN")
+    target_link_libraries(flutter-pi
+      ${LIBGSTREAMER_LDFLAGS}
+      ${LIBGSTREAMER_APP_LDFLAGS}
+      ${LIBGSTREAMER_AUDIO_LIBRARY_DIRS}
+    )
+    target_include_directories(flutter-pi PRIVATE
+      ${LIBGSTREAMER_INCLUDE_DIRS}
+      ${LIBGSTREAMER_APP_INCLUDE_DIRS}
+      ${LIBGSTREAMER_AUDIO_INCLUDE_DIRS}
+    )
+    target_compile_options(flutter-pi PRIVATE
+      ${LIBGSTREAMER_CFLAGS}
+      ${LIBGSTREAMER_APP_CFLAGS}
+      ${LIBGSTREAMER_AUDIO_CFLAGS}
+    )
+  else()
+    message(NOTICE "Couldn't find gstreamer libraries. Gstreamer audio player plugin won't be build.")
   endif()
 endif()
 

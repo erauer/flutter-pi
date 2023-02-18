@@ -169,7 +169,8 @@ static int add_locale_variants(struct concurrent_pointer_set *locales, const cha
     at = strchr(dot ? dot : (underscore ? underscore : locale_description), '@');
 
     if (at != NULL) {
-        modifier = strdup(at);
+        //exclude @
+        modifier = strdup(at + 1);
         if (modifier == NULL) {
             ok = ENOMEM;
             goto fail_return_ok;
@@ -179,7 +180,8 @@ static int add_locale_variants(struct concurrent_pointer_set *locales, const cha
     }
 
     if (dot != NULL) {
-        codeset = strndup(dot, next_delim - dot);
+        //exclude . and @
+        codeset = strndup(dot + 1, next_delim - dot - 1);
         if (codeset == NULL) {
             ok = ENOMEM;
             goto fail_free_modifier;
@@ -188,7 +190,8 @@ static int add_locale_variants(struct concurrent_pointer_set *locales, const cha
     }
 
     if (underscore != NULL) {
-        territory = strndup(underscore, next_delim - underscore);
+        //exclude _ and .
+        territory = strndup(underscore + 1, next_delim - underscore - 1);
         if (territory == NULL) {
             ok = ENOMEM;
             goto fail_free_codeset;
@@ -196,6 +199,7 @@ static int add_locale_variants(struct concurrent_pointer_set *locales, const cha
         next_delim = underscore;
     }
 
+    //nothing to exclude
     language = strndup(locale_description, next_delim - locale_description);
     if (language == NULL) {
         ok = ENOMEM;
@@ -397,4 +401,44 @@ const FlutterLocale *locales_on_compute_platform_resolved_locale(struct locales 
     (void) n_fl_locales;
     
     return fl_locales[0];
+}
+
+void locales_print(const struct locales *locales) {
+    DEBUG_ASSERT(locales != NULL);
+
+    printf("==============Locale==============\n");
+    printf("Flutter locale:\n");
+    if (locales->default_flutter_locale != NULL) {
+        printf("  default: %s", locales->default_flutter_locale->language_code);
+        if (locales->default_flutter_locale->country_code != NULL) {
+            printf("_%s", locales->default_flutter_locale->country_code);
+        }
+        if (locales->default_flutter_locale->script_code != NULL) {
+            printf(".%s", locales->default_flutter_locale->script_code);
+        }
+        if (locales->default_flutter_locale->variant_code != NULL) {
+            printf("@%s", locales->default_flutter_locale->variant_code);
+        }
+
+        printf("\n");
+    } else {
+        printf("  default: NULL\n");
+    }
+
+    printf("  locales:");
+    for (size_t idx = 0; idx < locales->n_locales; idx++) {
+        const FlutterLocale *locale = locales->flutter_locales[idx];
+        printf(" %s", locale->language_code);
+        if (locale->country_code != NULL) {
+            printf("_%s", locale->country_code);
+        }
+        if (locale->script_code != NULL) {
+            printf(".%s", locale->script_code);
+        }
+        if (locale->variant_code != NULL) {
+            printf("@%s", locale->variant_code);
+        }
+    }
+
+    printf("\n===================================\n");
 }
